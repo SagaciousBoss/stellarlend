@@ -10,6 +10,7 @@ on:
       - '**/*.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - 'ops/runbooks/**'
   pull_request:
     paths:
       - 'turbo.json'
@@ -19,6 +20,7 @@ on:
       - '**/*.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - 'ops/runbooks/**'
 
 permissions:
   contents: read
@@ -39,11 +41,13 @@ jobs:
       - name: Check the standalone Rust crates
         run: >-
           bash scripts/cargo-check.sh
+          --workspace contracts/admin
           --workspace contracts/oracle
           --workspace contracts/liquidation
           --workspace contracts/pool_math
-      - name: Oracle staleness and liquidation checks tests
+      - name: Standalone contract unit and integration tests
         run: |
+          cargo test --manifest-path contracts/admin/Cargo.toml
           cargo test --manifest-path contracts/oracle/Cargo.toml
           cargo test --manifest-path contracts/liquidation/Cargo.toml
       - name: Upload check summary
