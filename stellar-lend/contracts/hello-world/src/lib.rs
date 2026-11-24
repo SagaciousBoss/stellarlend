@@ -69,6 +69,11 @@ pub mod types;
 /// Per-block memoized borrow-rate curve evaluations (issue #1640)
 pub mod rates;
 
+/// Oracle freshness attestations with staking slash (issue #1570)
+pub mod oracle_stake;
+/// Interest capitalisation compounding at per-block cadence (issue #1574)
+pub mod interest;
+
 /// Per-pool withdrawal queue when utilization is pinned (issue #1586)
 pub mod withdraw_queue;
 
@@ -914,4 +919,121 @@ pub fn distribute_revenue(
     amount: i128,
 ) -> Result<fee_switch::DistributionResult, errors::LendingError> {
     fee_switch::distribute_revenue(&env, amount).map_err(Into::into)
+}
+
+// ── Oracle freshness attestations with staking slash (issue #1570) ──────────
+
+#[no_mangle]
+pub fn set_min_oracle_stake(
+    env: Env,
+    admin: Address,
+    amount: i128,
+) -> Result<(), errors::LendingError> {
+    oracle_stake::set_min_stake(&env, admin, amount)
+        .map_err(|_| errors::LendingError::InvalidParameter)
+}
+
+#[no_mangle]
+pub fn set_oracle_slash_rate(
+    env: Env,
+    admin: Address,
+    rate_bps: i128,
+) -> Result<(), errors::LendingError> {
+    oracle_stake::set_slash_rate(&env, admin, rate_bps)
+        .map_err(|_| errors::LendingError::InvalidFee)
+}
+
+#[no_mangle]
+pub fn set_oracle_staleness_threshold(
+    env: Env,
+    admin: Address,
+    threshold: u64,
+) -> Result<(), errors::LendingError> {
+    oracle_stake::set_staleness_threshold(&env, admin, threshold)
+        .map_err(|_| errors::LendingError::InvalidParameter)
+}
+
+#[no_mangle]
+pub fn stake_oracle(
+    env: Env,
+    oracle: Address,
+    amount: i128,
+) -> Result<oracle_stake::OracleStake, errors::LendingError> {
+    oracle_stake::stake(&env, oracle, amount)
+        .map_err(|_| errors::LendingError::InvalidAmount)
+}
+
+#[no_mangle]
+pub fn unstake_oracle(
+    env: Env,
+    oracle: Address,
+) -> Result<i128, errors::LendingError> {
+    oracle_stake::unstake(&env, oracle)
+        .map_err(|_| errors::LendingError::InvalidState)
+}
+
+#[no_mangle]
+pub fn attest_oracle_freshness(
+    env: Env,
+    oracle: Address,
+    attestation_timestamp: u64,
+) -> Result<oracle_stake::AttestationResult, errors::LendingError> {
+    oracle_stake::attest_freshness(&env, oracle, attestation_timestamp)
+        .map_err(|_| errors::LendingError::DataNotFound)
+}
+
+#[no_mangle]
+pub fn get_oracle_stake(
+    env: Env,
+    oracle: Address,
+) -> Option<oracle_stake::OracleStake> {
+    oracle_stake::get_stake(&env, &oracle)
+}
+
+#[no_mangle]
+pub fn get_total_oracle_staked(env: Env) -> i128 {
+    oracle_stake::get_total_staked(&env)
+}
+
+#[no_mangle]
+pub fn get_oracle_slash_count(env: Env, oracle: Address) -> u32 {
+    oracle_stake::get_slash_count(&env, &oracle)
+// ── Interest capitalisation compounding at per-block cadence (issue #1574) ──
+
+#[no_mangle]
+pub fn set_compounding_interval(
+    env: Env,
+    admin: Address,
+    interval_ledgers: u32,
+) -> Result<(), errors::LendingError> {
+    interest::set_compounding_interval(&env, admin, interval_ledgers)
+        .map_err(|e| match e {
+            interest::CompoundingError::Unauthorized => errors::LendingError::Unauthorized,
+            interest::CompoundingError::InvalidInterval => errors::LendingError::InvalidParameter,
+            _ => errors::LendingError::InvalidParameter,
+        })
+}
+
+#[no_mangle]
+pub fn compound_interest(env: Env) -> Result<interest::CompoundingResult, errors::LendingError> {
+    interest::compound_interest(&env).map_err(|e| match e {
+        interest::CompoundingError::Unauthorized => errors::LendingError::Unauthorized,
+        interest::CompoundingError::InvalidInterval => errors::LendingError::InvalidParameter,
+        _ => errors::LendingError::Overflow,
+    })
+}
+
+#[no_mangle]
+pub fn is_compounding_due(env: Env) -> bool {
+    interest::is_compounding_due(&env)
+}
+
+#[no_mangle]
+pub fn get_compounding_config(env: Env) -> interest::CompoundingConfig {
+    interest::get_compounding_config(&env)
+}
+
+#[no_mangle]
+pub fn get_total_capitalised(env: Env) -> i128 {
+    interest::get_total_capitalised(&env)
 }
