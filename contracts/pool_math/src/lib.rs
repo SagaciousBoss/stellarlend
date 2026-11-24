@@ -132,8 +132,10 @@ pub fn health_factor_bps(
     if debt_value == 0 {
         return Ok(NO_DEBT_HEALTH_FACTOR);
     }
-    let adjusted = apply_bps(collateral_value, liquidation_threshold_bps)?;
-    adjusted.checked_div(debt_value).ok_or(MathError::Overflow)
+    // Keep the threshold in the numerator: `collateral * threshold / debt`.
+    // Applying bps first would divide by the divisor twice and report a
+    // health factor of 1 instead of the intended basis-point value.
+    checked_mul_div(collateral_value, liquidation_threshold_bps, debt_value)
 }
 
 /// Maximum additional debt a position can take while respecting `ltv_bps`.
@@ -150,7 +152,7 @@ pub fn max_borrow_amount(
         capacity - current_debt
     } else {
         0
-    }
+    })
 }
 
 /// Collateral seized for a repayment, including the liquidation incentive.
@@ -170,9 +172,13 @@ pub fn max_repayable(
     if total_debt < 0 || close_factor_bps < 0 || close_factor_bps > BPS_DIVISOR || requested < 0 {
         return Err(MathError::InvalidInput);
     }
+    // A request that covers the whole debt closes the position outright and
+    // is exempt from the close factor. Partial repayments stay capped.
+    if requested >= total_debt {
+        return Ok(total_debt);
+    }
     let cap = apply_bps(total_debt, close_factor_bps)?;
-    let limit = if cap < requested { cap } else { requested };
-    Ok(if limit < total_debt { limit } else { total_debt })
+    Ok(if cap < requested { cap } else { requested })
 }
 
 #[cfg(test)]

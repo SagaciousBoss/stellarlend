@@ -12,9 +12,9 @@ The fuzz package lives under `stellar-lend/fuzz/`.
 | `lending_actions` | Broader lending state-machine coverage, including withdraw, pause toggles, oracle writes, and views |
 | `amm_actions` | AMM action coverage for swaps, liquidity changes, and pool views |
 | `bridge_actions` | Bridge message/action coverage |
-| `pool_math` | Extreme parameter coverage for utilisation, interest, swaps, liquidity shares and health factor |
+| `pool_math` | Extreme parameter coverage for utilisation, interest, index accrual, borrow capacity, seizure sizing and health factor |
 
-The `pool_math` target lives in its own crate at `fuzz/pool_math/` and tests `contracts/pool_math/src/lib.rs`. Its 136-byte inputs are decoded as raw little-endian parameters, including `u128::MAX`-scale amounts and reserves. Percentages are normalised into their valid domain; all other values are passed through unchanged. Accepted results must stay within documented bounds (utilisation at or below 10,000 bps, swaps that never drain the output reserve, non-decreasing interest and health factor).
+The `pool_math` target lives in its own crate at `fuzz/pool_math/` and tests the shared `contracts/pool_math/src/lib.rs` crate. Its 136-byte inputs are decoded as eight raw little-endian `i128` parameters plus a duration, covering negative, zero and `i128::MIN`/`i128::MAX` values. Percentages are normalised into `0..=10_000` (health-factor thresholds into `1..=10_000`); amounts are mapped to non-negative values without overflowing on `i128::MIN`. Accepted results must stay within documented bounds: utilisation in `0..=10_000` bps, non-decreasing interest and lending indexes, debt-free health factors equal to the sentinel, borrow capacity bounded by collateral, and repayments bounded by both debt and the requested amount.
 
 Run the replayable invariant tests on a stable toolchain (no clang or nightly needed):
 
