@@ -6,6 +6,7 @@
   "engines": {
     "node": ">=20"
   },
+  "packageManager": "npm@10.8.2",
   "workspaces": [
     "api",
     "oracle",
@@ -16,6 +17,7 @@
   ],
   "scripts": {
     "build": "tsc --noEmit",
+    "cargo-check": "bash scripts/cargo-check.sh",
     "test": "jest",
     "typecheck": "tsc --noEmit",
     "devnet": "bash scripts/devnet/bootstrap.sh",

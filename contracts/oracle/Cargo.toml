@@ -1,0 +1,14 @@
+[package]
+name = "stellarlend-oracle-staleness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Shared oracle freshness policy for risk-sensitive reads"
+
+# Standalone workspace: the root Cargo.toml is a legacy manifest whose members
+# moved under stellar-lend/, so declaring [workspace] keeps this crate
+# independently checkable by scripts/cargo-check.sh.
+[workspace]
+
+[package.metadata.docs.rs]
+all-features = true

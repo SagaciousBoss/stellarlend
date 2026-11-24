@@ -1,0 +1,31 @@
+[package]
+name = "stellarlend-pool-math-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "libFuzzer harness for extreme lending pool math parameters"
+
+# Standalone workspace so nightly-only fuzz dependencies never leak into a
+# normal cargo check of the protocol crates.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+default = []
+# Enabled by `cargo +nightly fuzz run --features libfuzzer pool_math`. Keeping
+# libFuzzer optional lets `cargo test` run deterministic invariant tests on
+# stable toolchains that do not have clang installed.
+libfuzzer = ["dep:libfuzzer-sys"]
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", optional = true }
+stellarlend-pool-math = { path = "../../contracts/pool_math" }
+
+[[bin]]
+name = "pool_math"
+path = "fuzz_targets/pool_math.rs"
+test = false
+doc = false
+required-features = ["libfuzzer"]

@@ -12,8 +12,25 @@ The fuzz package lives under `stellar-lend/fuzz/`.
 | `lending_actions` | Broader lending state-machine coverage, including withdraw, pause toggles, oracle writes, and views |
 | `amm_actions` | AMM action coverage for swaps, liquidity changes, and pool views |
 | `bridge_actions` | Bridge message/action coverage |
+| `pool_math` | Extreme parameter coverage for utilisation, interest, swaps, liquidity shares and health factor |
 
-Each target interprets input as a sequence of fixed-size 32-byte actions defined in `stellar-lend/fuzz/src/encoding.rs`.
+The `pool_math` target lives in its own crate at `fuzz/pool_math/` and tests `contracts/pool_math/src/lib.rs`. Its 136-byte inputs are decoded as raw little-endian parameters, including `u128::MAX`-scale amounts and reserves. Percentages are normalised into their valid domain; all other values are passed through unchanged. Accepted results must stay within documented bounds (utilisation at or below 10,000 bps, swaps that never drain the output reserve, non-decreasing interest and health factor).
+
+Run the replayable invariant tests on a stable toolchain (no clang or nightly needed):
+
+```bash
+cargo test --manifest-path fuzz/pool_math/Cargo.toml
+```
+
+Run the coverage-guided target with libFuzzer:
+
+```bash
+cargo +nightly fuzz run --features libfuzzer pool_math fuzz/pool_math/corpus -- -max_total_time=300
+```
+
+Checked-in seeds live in `fuzz/pool_math/corpus/pool_math/` and are replayed by the stable invariant tests. The libFuzzer dependency is feature-gated so standard `cargo test` and `cargo check` do not require a C++ toolchain.
+
+Each contract state-machine target interprets input as a sequence of fixed-size 32-byte actions defined in `stellar-lend/fuzz/src/encoding.rs`; `pool_math` uses its own parameter decoder described below.
 
 ## Strategy
 

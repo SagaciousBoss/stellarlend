@@ -1,0 +1,27 @@
+name: pool-math-fuzz
+
+on:
+  push:
+    paths:
+      - 'contracts/pool_math/**'
+      - 'fuzz/pool_math/**'
+      - 'docs/fuzzing.md'
+  pull_request:
+    paths:
+      - 'contracts/pool_math/**'
+      - 'fuzz/pool_math/**'
+      - 'docs/fuzzing.md'
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Pool math unit tests
+        run: cargo test --manifest-path contracts/pool_math/Cargo.toml
+      - name: Replayable fuzz invariants
+        run: cargo test --manifest-path fuzz/pool_math/Cargo.toml

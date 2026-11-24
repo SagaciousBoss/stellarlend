@@ -1,6 +1,37 @@
 # Developer Tooling Guide
 
-This guide covers the local mainnet-derived development workflow, runtime trace analysis, deployment verification, and mutation testing additions introduced for the devtooling issues.
+This guide covers the local mainnet-derived development workflow, runtime trace analysis, deployment verification, mutation testing additions introduced for the devtooling issues, and the repo-wide Rust type-check task.
+
+## Repo-wide `cargo-check`
+
+Run every valid Cargo workspace in the repository through `cargo check` with one command:
+
+```bash
+npx --yes turbo@2 run cargo-check
+```
+
+The root `cargo-check` npm script invokes `scripts/cargo-check.sh`. The script discovers manifests that declare `[workspace]`, skips manifests Cargo cannot load (the legacy root workspace points at members that moved into `stellar-lend/`), and checks the rest with `--workspace --all-targets`. Every workspace gets a `CARGO_TARGET_DIR` keyed by the toolchain version and the contents of its Cargo manifests, with `CARGO_INCREMENTAL=1`, so a second Turbo run reuses the compiled artifacts. Turbo caches the resulting `.turbo/cargo-check/` tree and invalidates it when any Rust source or manifest changes.
+
+Useful options:
+
+```bash
+# Check one crate/workspace only
+bash scripts/cargo-check.sh --workspace contracts/pool_math
+
+# Pass arguments through to cargo check
+bash scripts/cargo-check.sh -- --features testutils
+
+# Force a cold, disposable build directory
+bash scripts/cargo-check.sh --no-cache
+```
+
+Each check emits structured logs (`event=check_start`, `event=check_complete`, `event=summary`) with workspace, cache state, exit code and duration. A machine-readable report is written to `.turbo/cargo-check/last-run.json`. A failing workspace makes the task exit non-zero; add `--fail-fast` to stop after the first failure.
+
+The script's plan-level tests use a fake `cargo` binary and run in CI:
+
+```bash
+node --test scripts/__tests__/cargo-check.test.mjs
+```
 
 ## Local Mainnet-Derived Sandbox
 

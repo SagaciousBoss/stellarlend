@@ -1,0 +1,13 @@
+[package]
+name = "stellarlend-pool-math"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Overflow-safe lending pool math used by the pool-math fuzz harness"
+
+# Standalone workspace so fuzzing and CI can check this crate without pulling
+# in the legacy root workspace or the large stellar-lend workspace.
+[workspace]
+
+[package.metadata.docs.rs]
+all-features = true

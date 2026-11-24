@@ -1,0 +1,13 @@
+[package]
+name = "stellarlend-liquidation-checks"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Staleness-gated risk checks for liquidation reads"
+
+# Standalone so the crate can be type-checked independently of the legacy root
+# workspace and the large stellar-lend workspace.
+[workspace]
+
+[dependencies]
+stellarlend-oracle-staleness = { path = "../oracle" }
