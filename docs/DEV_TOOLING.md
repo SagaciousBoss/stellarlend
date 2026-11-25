@@ -27,7 +27,7 @@ bash scripts/cargo-check.sh --no-cache
 
 Each check emits structured logs (`event=check_start`, `event=check_complete`, `event=summary`) with workspace, cache state, exit code and duration. A machine-readable report is written to `.turbo/cargo-check/last-run.json`. A failing workspace makes the task exit non-zero; add `--fail-fast` to stop after the first failure.
 
-The script's plan-level tests use a fake `cargo` binary and run in CI:
+The script's plan-level tests use a fake `cargo` binary, so they are fast and deterministic enough for CI:
 
 ```bash
 node --test scripts/__tests__/cargo-check.test.mjs
