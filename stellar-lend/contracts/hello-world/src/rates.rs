@@ -26,8 +26,10 @@
 //! storage.  Callers can read them via [`get_cache_metrics`] for dashboards
 //! and CI assertions.
 
-use soroban_sdk::{contracttype, Env};
+use soroban_sdk::{contracterror, contracttype, Address, Env};
+use stellarlend_math::rates::{RateCurve, RateModelKind};
 
+use crate::events::emit_event;
 use crate::interest_rate::{
     calculate_borrow_rate, calculate_supply_rate, calculate_utilization, InterestRateError,
 };
@@ -210,6 +212,180 @@ pub fn invalidate_cache(env: &Env) {
 /// Read the current hit/miss/error counters without modifying them.
 pub fn get_cache_metrics(env: &Env) -> RateCacheMetrics {
     load_metrics(env)
+}
+
+// ── Per-pool dynamic rate curves (issue #1522) ────────────────────────────────
+//
+// Each pool may carry its own curve, so its borrow rate responds to that pool's
+// utilization rather than to the global curve in `interest_rate`. Evaluation
+// reuses `stellarlend_math::rates::RateCurve`, so the shape math has one
+// implementation shared with the rest of the protocol.
+//
+// Rates are not memoized here: a pool curve is a pure function of its stored
+// parameters and the utilization passed in, so the lookup is the only storage
+// read on the hot path.
+
+/// Largest borrow rate a pool curve may produce, in basis points (1,000% APR).
+pub const MAX_POOL_RATE_BPS: i128 = 100_000;
+
+const BPS_DENOMINATOR: i128 = 10_000;
+
+/// Errors returned by the per-pool rate curves. Codes start at 900.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum PoolRateError {
+    /// Caller is not the protocol admin.
+    Unauthorized = 900,
+    /// Utilization must be within `[0, 10_000]` basis points.
+    InvalidUtilization = 901,
+    /// Curve parameters are outside their allowed ranges.
+    InvalidCurve = 902,
+    /// No curve has been configured for the pool.
+    CurveNotFound = 903,
+    /// An arithmetic operation overflowed.
+    Overflow = 904,
+}
+
+/// Shape of a pool curve. Maps onto `RateModelKind` in the shared math crate.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PoolCurveShape {
+    /// One slope across the whole utilization range.
+    Linear = 0,
+    /// Two segments joined at the kink.
+    Kink = 1,
+    /// Linear, plus a jump term above the kink.
+    Jump = 2,
+}
+
+/// Borrow-rate curve for one pool. Every value is in basis points.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PoolRateCurve {
+    /// Which curve shape to evaluate.
+    pub shape: PoolCurveShape,
+    /// Borrow rate at 0% utilization.
+    pub base_rate_bps: i128,
+    /// Utilization at which the curve steepens, in `(0, 10_000)`.
+    pub kink_utilization_bps: i128,
+    /// Slope below the kink.
+    pub multiplier_bps: i128,
+    /// Slope above the kink.
+    pub jump_multiplier_bps: i128,
+}
+
+/// Storage keys for per-pool curves.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PoolCurveKey {
+    /// Curve for one pool, keyed by the pool's address.
+    Curve(Address),
+}
+
+/// Configure the borrow-rate curve for `pool` (admin-only). Replaces any
+/// existing curve for that pool.
+pub fn set_pool_curve(
+    env: &Env,
+    caller: Address,
+    pool: Address,
+    curve: PoolRateCurve,
+) -> Result<(), PoolRateError> {
+    caller.require_auth();
+    crate::admin::require_admin(env, &caller).map_err(|_| PoolRateError::Unauthorized)?;
+    validate_pool_curve(&curve)?;
+
+    env.storage()
+        .persistent()
+        .set(&PoolCurveKey::Curve(pool.clone()), &curve);
+    emit_event(env, "pool_rate_curve_set", "curve", (pool, curve));
+    Ok(())
+}
+
+/// The configured curve for `pool`, if any.
+pub fn get_pool_curve(env: &Env, pool: Address) -> Option<PoolRateCurve> {
+    env.storage()
+        .persistent()
+        .get::<PoolCurveKey, PoolRateCurve>(&PoolCurveKey::Curve(pool))
+}
+
+/// Borrow rate (bps) for `pool` at `utilization_bps`, using the pool's own
+/// curve. Fails with `CurveNotFound` when the pool has no curve.
+pub fn pool_borrow_rate(
+    env: &Env,
+    pool: Address,
+    utilization_bps: i128,
+) -> Result<i128, PoolRateError> {
+    if !(0..=BPS_DENOMINATOR).contains(&utilization_bps) {
+        return Err(PoolRateError::InvalidUtilization);
+    }
+    let curve = get_pool_curve(env, pool).ok_or(PoolRateError::CurveNotFound)?;
+    evaluate_pool_curve(&curve, utilization_bps)
+}
+
+/// Evaluate `curve` at `utilization_bps` without touching storage.
+pub fn evaluate_pool_curve(
+    curve: &PoolRateCurve,
+    utilization_bps: i128,
+) -> Result<i128, PoolRateError> {
+    if !(0..=BPS_DENOMINATOR).contains(&utilization_bps) {
+        return Err(PoolRateError::InvalidUtilization);
+    }
+    to_math_curve(curve)
+        .borrow_rate(utilization_bps)
+        .map_err(|_| PoolRateError::Overflow)
+}
+
+/// Utilization in basis points for a pool with `total_borrows` out of
+/// `total_deposits`. Returns 0 for an empty pool and caps at 100%.
+pub fn pool_utilization_bps(
+    total_borrows: i128,
+    total_deposits: i128,
+) -> Result<i128, PoolRateError> {
+    if total_borrows < 0 || total_deposits < 0 {
+        return Err(PoolRateError::InvalidUtilization);
+    }
+    if total_deposits == 0 {
+        return Ok(0);
+    }
+    let scaled = total_borrows
+        .checked_mul(BPS_DENOMINATOR)
+        .ok_or(PoolRateError::Overflow)?;
+    Ok((scaled / total_deposits).min(BPS_DENOMINATOR))
+}
+
+fn validate_pool_curve(curve: &PoolRateCurve) -> Result<(), PoolRateError> {
+    if curve.base_rate_bps < 0 || curve.multiplier_bps < 0 || curve.jump_multiplier_bps < 0 {
+        return Err(PoolRateError::InvalidCurve);
+    }
+    // A kink at 0 or at 100% would divide by zero in the segment math.
+    if curve.kink_utilization_bps <= 0 || curve.kink_utilization_bps >= BPS_DENOMINATOR {
+        return Err(PoolRateError::InvalidCurve);
+    }
+    let ceiling = curve
+        .base_rate_bps
+        .checked_add(curve.multiplier_bps)
+        .and_then(|sum| sum.checked_add(curve.jump_multiplier_bps))
+        .ok_or(PoolRateError::Overflow)?;
+    if ceiling > MAX_POOL_RATE_BPS {
+        return Err(PoolRateError::InvalidCurve);
+    }
+    Ok(())
+}
+
+fn to_math_curve(curve: &PoolRateCurve) -> RateCurve {
+    RateCurve {
+        kind: match curve.shape {
+            PoolCurveShape::Linear => RateModelKind::Linear,
+            PoolCurveShape::Kink => RateModelKind::Kink,
+            PoolCurveShape::Jump => RateModelKind::Jump,
+        },
+        base_rate_bps: curve.base_rate_bps,
+        kink_utilization_bps: curve.kink_utilization_bps,
+        multiplier_bps: curve.multiplier_bps,
+        jump_multiplier_bps: curve.jump_multiplier_bps,
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -405,5 +581,212 @@ mod tests {
         let _ = m.hits.saturating_add(1);
         let _ = m.misses.saturating_add(1);
         let _ = m.errors.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+mod pool_curve_tests {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, testutils::Address as _};
+
+    #[contract]
+    struct RatesTestContract;
+
+    #[contractimpl]
+    impl RatesTestContract {
+        pub fn marker() {}
+    }
+
+    struct Fixture {
+        env: Env,
+        contract: Address,
+        admin: Address,
+    }
+
+    fn fixture() -> Fixture {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract = env.register(RatesTestContract, ());
+        let admin = Address::generate(&env);
+        env.as_contract(&contract, || {
+            crate::admin::set_admin(&env, admin.clone(), None).unwrap();
+        });
+        Fixture {
+            env,
+            contract,
+            admin,
+        }
+    }
+
+    fn kink_curve() -> PoolRateCurve {
+        PoolRateCurve {
+            shape: PoolCurveShape::Kink,
+            base_rate_bps: 100,
+            kink_utilization_bps: 8_000,
+            multiplier_bps: 2_000,
+            jump_multiplier_bps: 10_000,
+        }
+    }
+
+    #[test]
+    fn kink_curve_is_piecewise_below_and_above_the_kink() {
+        let curve = kink_curve();
+        // Below the kink: base + u / kink * multiplier.
+        assert_eq!(evaluate_pool_curve(&curve, 0), Ok(100));
+        assert_eq!(evaluate_pool_curve(&curve, 4_000), Ok(1_100));
+        // At the kink: base + multiplier.
+        assert_eq!(evaluate_pool_curve(&curve, 8_000), Ok(2_100));
+        // Above the kink: steeper by jump_multiplier over the excess range.
+        assert_eq!(evaluate_pool_curve(&curve, 9_000), Ok(7_100));
+    }
+
+    #[test]
+    fn linear_curve_uses_a_single_slope() {
+        let curve = PoolRateCurve {
+            shape: PoolCurveShape::Linear,
+            base_rate_bps: 0,
+            kink_utilization_bps: 8_000,
+            multiplier_bps: 1_000,
+            jump_multiplier_bps: 0,
+        };
+        assert_eq!(evaluate_pool_curve(&curve, 5_000), Ok(500));
+        assert_eq!(evaluate_pool_curve(&curve, 10_000), Ok(1_000));
+    }
+
+    #[test]
+    fn jump_curve_adds_jump_term_only_above_the_kink() {
+        let curve = PoolRateCurve {
+            shape: PoolCurveShape::Jump,
+            base_rate_bps: 100,
+            kink_utilization_bps: 8_000,
+            multiplier_bps: 2_000,
+            jump_multiplier_bps: 10_000,
+        };
+        // Linear part: 100 + 9_000 * 2_000 / 10_000 = 1_900; jump: 1_000 * 10_000 / 2_000 = 5_000.
+        assert_eq!(evaluate_pool_curve(&curve, 9_000), Ok(6_900));
+        // Below the kink there is no jump term: 100 + 4_000 * 2_000 / 10_000 = 900.
+        assert_eq!(evaluate_pool_curve(&curve, 4_000), Ok(900));
+    }
+
+    #[test]
+    fn each_pool_prices_from_its_own_curve() {
+        let f = fixture();
+        let pool_a = Address::generate(&f.env);
+        let pool_b = Address::generate(&f.env);
+        f.env.as_contract(&f.contract, || {
+            set_pool_curve(&f.env, f.admin.clone(), pool_a.clone(), kink_curve()).unwrap();
+            set_pool_curve(
+                &f.env,
+                f.admin.clone(),
+                pool_b.clone(),
+                PoolRateCurve {
+                    shape: PoolCurveShape::Linear,
+                    base_rate_bps: 500,
+                    kink_utilization_bps: 8_000,
+                    multiplier_bps: 0,
+                    jump_multiplier_bps: 0,
+                },
+            )
+            .unwrap();
+
+            // 100 + 5_000 * 2_000 / 8_000 = 1_350
+            assert_eq!(pool_borrow_rate(&f.env, pool_a.clone(), 5_000), Ok(1_350));
+            assert_eq!(pool_borrow_rate(&f.env, pool_b.clone(), 5_000), Ok(500));
+        });
+    }
+
+    #[test]
+    fn invalid_curves_are_rejected() {
+        let f = fixture();
+        let pool = Address::generate(&f.env);
+        let base = kink_curve();
+        let bad_curves = [
+            PoolRateCurve {
+                kink_utilization_bps: 0,
+                ..base
+            },
+            PoolRateCurve {
+                kink_utilization_bps: BPS_DENOMINATOR,
+                ..base
+            },
+            PoolRateCurve {
+                base_rate_bps: -1,
+                ..base
+            },
+            PoolRateCurve {
+                multiplier_bps: -1,
+                ..base
+            },
+            PoolRateCurve {
+                jump_multiplier_bps: -1,
+                ..base
+            },
+            PoolRateCurve {
+                base_rate_bps: MAX_POOL_RATE_BPS,
+                multiplier_bps: 1,
+                ..base
+            },
+        ];
+        f.env.as_contract(&f.contract, || {
+            for curve in bad_curves {
+                assert_eq!(
+                    set_pool_curve(&f.env, f.admin.clone(), pool.clone(), curve),
+                    Err(PoolRateError::InvalidCurve)
+                );
+            }
+            assert_eq!(get_pool_curve(&f.env, pool.clone()), None);
+        });
+    }
+
+    #[test]
+    fn utilization_outside_range_is_rejected() {
+        let f = fixture();
+        let pool = Address::generate(&f.env);
+        f.env.as_contract(&f.contract, || {
+            assert_eq!(
+                pool_borrow_rate(&f.env, pool.clone(), -1),
+                Err(PoolRateError::InvalidUtilization)
+            );
+            assert_eq!(
+                pool_borrow_rate(&f.env, pool.clone(), BPS_DENOMINATOR + 1),
+                Err(PoolRateError::InvalidUtilization)
+            );
+        });
+    }
+
+    #[test]
+    fn pool_without_a_curve_reports_not_found() {
+        let f = fixture();
+        let pool = Address::generate(&f.env);
+        f.env.as_contract(&f.contract, || {
+            assert_eq!(
+                pool_borrow_rate(&f.env, pool.clone(), 5_000),
+                Err(PoolRateError::CurveNotFound)
+            );
+        });
+    }
+
+    #[test]
+    fn non_admin_cannot_set_a_curve() {
+        let f = fixture();
+        let stranger = Address::generate(&f.env);
+        let pool = Address::generate(&f.env);
+        f.env.as_contract(&f.contract, || {
+            assert_eq!(
+                set_pool_curve(&f.env, stranger.clone(), pool.clone(), kink_curve()),
+                Err(PoolRateError::Unauthorized)
+            );
+        });
+    }
+
+    #[test]
+    fn pool_utilization_is_borrows_over_deposits_capped_at_full() {
+        assert_eq!(pool_utilization_bps(5_000, 10_000), Ok(5_000));
+        assert_eq!(pool_utilization_bps(0, 0), Ok(0));
+        assert_eq!(pool_utilization_bps(15_000, 10_000), Ok(BPS_DENOMINATOR));
+        assert_eq!(
+            pool_utilization_bps(-1, 10),
+            Err(PoolRateError::InvalidUtilization)
+        );
     }
 }

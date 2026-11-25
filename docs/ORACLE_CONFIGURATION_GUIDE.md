@@ -490,24 +490,6 @@ certoraRun stellar-lend/contracts/lending/certora/oracle_integration.spec
 cargo test -p stellarlend-lending --features spec -- spec::oracle_spec
 ```
 
-## Shared Staleness Gate for Risk Reads
-
-`contracts/oracle/src/staleness.rs` and `contracts/liquidation/src/checks.rs` provide one mandatory gate for every price that feeds a risk calculation. Raw observations are private to the feed layer; consumers receive a `FreshPrice` only after `check_staleness` has verified all of the following:
-
-- an observation exists for the requested asset;
-- the price is strictly positive;
-- the timestamp is not in the future;
-- `now - timestamp <= max_staleness_seconds` (a price exactly at the limit is still fresh).
-
-`LiquidationChecks` wraps `GuardedOracleReads`, so health factor, close-factor and seize calculations cannot read an unverified observation. Missing, stale and future-dated prices abort the decision with `LiquidationCheckError::StaleOracle` rather than silently falling back.
-
-Each accepted or rejected read emits a structured `StalenessEvent` through the `StalenessEvents` sink. Production integrations can forward these events to contract logs/metrics; `RecordingEvents` is provided for tests and is what the unit and integration tests assert on.
-
-```bash
-cargo test --manifest-path contracts/oracle/Cargo.toml
-cargo test --manifest-path contracts/liquidation/Cargo.toml
-```
-
 ## Conclusion
 
 Effective oracle configuration management is critical for the security and reliability of the StellarLend protocol. This guide provides the procedures and considerations necessary for maintaining a robust oracle system while ensuring proper role separation and security controls.

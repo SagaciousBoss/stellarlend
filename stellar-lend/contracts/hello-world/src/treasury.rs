@@ -19,10 +19,12 @@
 //! All write operations require the caller to be the protocol admin.
 
 #![allow(unused)]
-use soroban_sdk::{contracterror, contracttype, Address, Env};
+use soroban_sdk::{contracterror, contracttype, Address, Env, Vec};
 
 use crate::deposit::DepositDataKey;
-use crate::events::{emit_fee_config_updated, emit_reserves_claimed, emit_treasury_set};
+use crate::events::{
+    emit_event, emit_fee_config_updated, emit_reserves_claimed, emit_treasury_set,
+};
 
 /// Errors that can occur during treasury operations
 #[contracterror]
@@ -41,6 +43,16 @@ pub enum TreasuryError {
     TreasuryNotSet = 5,
     /// Fee value out of valid range (0–10000 bps)
     InvalidFee = 6,
+    /// Voter has no vote-escrow voting power
+    NoVotingPower = 7,
+    /// Recipient is not registered with the allocator
+    UnknownRecipient = 8,
+    /// Recipient is already registered with the allocator
+    DuplicateRecipient = 9,
+    /// The allocation quarter has not ended yet
+    QuarterNotEnded = 10,
+    /// The quarter has already been disbursed for this asset
+    AlreadyDisbursed = 11,
 }
 
 /// Storage keys for treasury-related data
@@ -304,4 +316,656 @@ pub fn claim_reserves(
     );
 
     Ok(())
+}
+
+// ============================================================================
+// DAO Treasury Allocator (issue #1524)
+// ============================================================================
+//
+// Each quarter the DAO splits a per-asset budget across registered recipients
+// in proportion to the vote weight behind each one. A vote's weight is the
+// voter's vote-escrow voting power when the vote is cast
+// (`vote_escrow::voting_power`), so voting strength follows governance tokens
+// the voter has locked.
+//
+// Quarter `q` covers the ledger timestamps `[q * QUARTER_SECONDS,
+// (q + 1) * QUARTER_SECONDS)`:
+//
+//   1. The admin registers recipients and sets the quarterly budget per asset.
+//   2. Voters vote for one recipient during the quarter. Voting again replaces
+//      the earlier vote and refreshes its weight.
+//   3. Once the quarter ends, anyone may call `disburse_quarter` once per
+//      asset. Recipient `i` receives `payable * tally_i / total_weight`, rounded
+//      down, where `payable = min(budget, protocol reserve)`. Rounding dust stays
+//      in the reserve.
+//
+// Payouts come from the same `ProtocolReserve` that `claim_reserves` uses, so
+// the allocator never pays out more than the treasury holds.
+
+/// Length of one allocation quarter: 90 days.
+pub const QUARTER_SECONDS: u64 = 90 * 24 * 60 * 60;
+
+/// Storage keys for the DAO treasury allocator.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum AllocatorDataKey {
+    /// Registered recipients, in registration order.
+    Recipients,
+    /// Quarterly budget for one asset (`None` = native XLM).
+    QuarterBudget(Option<Address>),
+    /// One voter's current vote for a quarter.
+    Vote(u64, Address),
+    /// Total vote weight behind one recipient in a quarter.
+    Tally(u64, Address),
+    /// Total vote weight cast in a quarter.
+    TotalWeight(u64),
+    /// Whether a quarter has been disbursed for an asset.
+    Disbursed(u64, Option<Address>),
+}
+
+/// A voter's current vote for one quarter.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllocatorVote {
+    /// Recipient the vote supports.
+    pub recipient: Address,
+    /// Voting power the vote carried when it was cast.
+    pub weight: i128,
+}
+
+/// One payout made by `disburse_quarter`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Disbursement {
+    /// Recipient paid.
+    pub recipient: Address,
+    /// Amount paid, in the asset's smallest unit.
+    pub amount: i128,
+}
+
+/// Quarter index that contains ledger `timestamp`.
+pub fn quarter_of(timestamp: u64) -> u64 {
+    timestamp / QUARTER_SECONDS
+}
+
+/// Register a recipient that can receive quarterly disbursements (admin-only).
+pub fn register_recipient(
+    env: &Env,
+    caller: Address,
+    recipient: Address,
+) -> Result<(), TreasuryError> {
+    caller.require_auth();
+    crate::admin::require_admin(env, &caller).map_err(|_| TreasuryError::Unauthorized)?;
+
+    let mut recipients = get_recipients(env);
+    if recipients.iter().any(|r| r == recipient) {
+        return Err(TreasuryError::DuplicateRecipient);
+    }
+    recipients.push_back(recipient.clone());
+    env.storage()
+        .persistent()
+        .set(&AllocatorDataKey::Recipients, &recipients);
+
+    emit_event(env, "treasury_recipient_registered", "recipient", recipient);
+    Ok(())
+}
+
+/// Registered recipients, in registration order.
+pub fn get_recipients(env: &Env) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get::<AllocatorDataKey, Vec<Address>>(&AllocatorDataKey::Recipients)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Set the budget that each quarter may disburse for `asset` (admin-only).
+pub fn set_quarter_budget(
+    env: &Env,
+    caller: Address,
+    asset: Option<Address>,
+    amount: i128,
+) -> Result<(), TreasuryError> {
+    caller.require_auth();
+    crate::admin::require_admin(env, &caller).map_err(|_| TreasuryError::Unauthorized)?;
+    if amount < 0 {
+        return Err(TreasuryError::InvalidAmount);
+    }
+
+    env.storage()
+        .persistent()
+        .set(&AllocatorDataKey::QuarterBudget(asset.clone()), &amount);
+    emit_event(
+        env,
+        "treasury_quarter_budget_set",
+        "budget",
+        (asset, amount),
+    );
+    Ok(())
+}
+
+/// Quarterly budget for `asset`. Zero when unset.
+pub fn get_quarter_budget(env: &Env, asset: Option<Address>) -> i128 {
+    env.storage()
+        .persistent()
+        .get::<AllocatorDataKey, i128>(&AllocatorDataKey::QuarterBudget(asset))
+        .unwrap_or(0)
+}
+
+/// Cast or replace the caller's vote for `recipient` in the current quarter.
+///
+/// The weight is the caller's vote-escrow voting power now. Voting again in the
+/// same quarter removes the earlier vote's weight first, so each voter counts
+/// once. Returns the weight recorded.
+pub fn vote_for_recipient(
+    env: &Env,
+    voter: Address,
+    recipient: Address,
+) -> Result<i128, TreasuryError> {
+    voter.require_auth();
+    if !is_registered(env, &recipient) {
+        return Err(TreasuryError::UnknownRecipient);
+    }
+    let weight =
+        crate::vote_escrow::voting_power(env, &voter).map_err(|_| TreasuryError::Overflow)?;
+    if weight <= 0 {
+        return Err(TreasuryError::NoVotingPower);
+    }
+
+    let quarter = quarter_of(env.ledger().timestamp());
+    let vote_key = AllocatorDataKey::Vote(quarter, voter.clone());
+    if let Some(previous) = env
+        .storage()
+        .persistent()
+        .get::<AllocatorDataKey, AllocatorVote>(&vote_key)
+    {
+        remove_weight(env, quarter, &previous.recipient, previous.weight)?;
+    }
+
+    add_weight(env, quarter, &recipient, weight)?;
+    env.storage().persistent().set(
+        &vote_key,
+        &AllocatorVote {
+            recipient: recipient.clone(),
+            weight,
+        },
+    );
+
+    emit_event(
+        env,
+        "treasury_vote_cast",
+        "vote",
+        (voter, recipient, weight),
+    );
+    Ok(weight)
+}
+
+/// Pay out a finished quarter's budget for `asset`, split by vote weight.
+///
+/// Anyone may call this once the quarter has ended. Each quarter and asset can
+/// be disbursed once; the flag is set before any transfer. The payable amount is
+/// `min(budget, protocol reserve)`. Returns the payouts made.
+pub fn disburse_quarter(
+    env: &Env,
+    asset: Option<Address>,
+    quarter: u64,
+) -> Result<Vec<Disbursement>, TreasuryError> {
+    // Reentrancy guard — prevents re-entry during token transfers
+    let _guard =
+        crate::reentrancy::ReentrancyGuard::new(env).map_err(|_| TreasuryError::Unauthorized)?;
+
+    let quarter_end = quarter
+        .checked_add(1)
+        .and_then(|next| next.checked_mul(QUARTER_SECONDS))
+        .ok_or(TreasuryError::Overflow)?;
+    if env.ledger().timestamp() < quarter_end {
+        return Err(TreasuryError::QuarterNotEnded);
+    }
+
+    let done_key = AllocatorDataKey::Disbursed(quarter, asset.clone());
+    if env.storage().persistent().has(&done_key) {
+        return Err(TreasuryError::AlreadyDisbursed);
+    }
+    env.storage().persistent().set(&done_key, &true);
+
+    let mut payouts: Vec<Disbursement> = Vec::new(env);
+    let total = total_weight(env, quarter);
+    let budget =
+        get_quarter_budget(env, asset.clone()).min(get_reserve_balance(env, asset.clone()));
+    if total <= 0 || budget <= 0 {
+        return Ok(payouts);
+    }
+
+    let mut paid: i128 = 0;
+    for recipient in get_recipients(env).iter() {
+        let tally = tally_of(env, quarter, &recipient);
+        if tally <= 0 {
+            continue;
+        }
+        let amount = budget.checked_mul(tally).ok_or(TreasuryError::Overflow)? / total;
+        if amount <= 0 {
+            continue;
+        }
+        paid = paid.checked_add(amount).ok_or(TreasuryError::Overflow)?;
+        payouts.push_back(Disbursement { recipient, amount });
+    }
+
+    if paid > 0 {
+        let reserve_key = DepositDataKey::ProtocolReserve(asset.clone());
+        let reserve = env
+            .storage()
+            .persistent()
+            .get::<DepositDataKey, i128>(&reserve_key)
+            .unwrap_or(0);
+        let new_reserve = reserve.checked_sub(paid).ok_or(TreasuryError::Overflow)?;
+        env.storage().persistent().set(&reserve_key, &new_reserve);
+    }
+
+    // Execute the token transfers outside of tests, as `claim_reserves` does.
+    #[cfg(not(test))]
+    if let Some(ref asset_addr) = asset {
+        let token_client = soroban_sdk::token::Client::new(env, asset_addr);
+        for payout in payouts.iter() {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &payout.recipient,
+                &payout.amount,
+            );
+        }
+    }
+
+    emit_event(
+        env,
+        "treasury_quarter_disbursed",
+        "disbursed",
+        (asset, quarter, paid),
+    );
+    Ok(payouts)
+}
+
+/// Total vote weight behind `recipient` in `quarter`.
+pub fn get_recipient_tally(env: &Env, quarter: u64, recipient: Address) -> i128 {
+    tally_of(env, quarter, &recipient)
+}
+
+fn is_registered(env: &Env, recipient: &Address) -> bool {
+    get_recipients(env).iter().any(|r| r == *recipient)
+}
+
+fn tally_of(env: &Env, quarter: u64, recipient: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get::<AllocatorDataKey, i128>(&AllocatorDataKey::Tally(quarter, recipient.clone()))
+        .unwrap_or(0)
+}
+
+fn total_weight(env: &Env, quarter: u64) -> i128 {
+    env.storage()
+        .persistent()
+        .get::<AllocatorDataKey, i128>(&AllocatorDataKey::TotalWeight(quarter))
+        .unwrap_or(0)
+}
+
+fn add_weight(
+    env: &Env,
+    quarter: u64,
+    recipient: &Address,
+    weight: i128,
+) -> Result<(), TreasuryError> {
+    let tally = tally_of(env, quarter, recipient)
+        .checked_add(weight)
+        .ok_or(TreasuryError::Overflow)?;
+    let total = total_weight(env, quarter)
+        .checked_add(weight)
+        .ok_or(TreasuryError::Overflow)?;
+    env.storage()
+        .persistent()
+        .set(&AllocatorDataKey::Tally(quarter, recipient.clone()), &tally);
+    env.storage()
+        .persistent()
+        .set(&AllocatorDataKey::TotalWeight(quarter), &total);
+    Ok(())
+}
+
+fn remove_weight(
+    env: &Env,
+    quarter: u64,
+    recipient: &Address,
+    weight: i128,
+) -> Result<(), TreasuryError> {
+    let tally = tally_of(env, quarter, recipient)
+        .checked_sub(weight)
+        .ok_or(TreasuryError::Overflow)?;
+    let total = total_weight(env, quarter)
+        .checked_sub(weight)
+        .ok_or(TreasuryError::Overflow)?;
+    env.storage()
+        .persistent()
+        .set(&AllocatorDataKey::Tally(quarter, recipient.clone()), &tally);
+    env.storage()
+        .persistent()
+        .set(&AllocatorDataKey::TotalWeight(quarter), &total);
+    Ok(())
+}
+
+#[cfg(test)]
+mod allocator_tests {
+    use super::*;
+    use crate::vote_escrow::{EscrowLock, VoteEscrowKey, MAX_LOCK_SECONDS};
+    use soroban_sdk::{
+        contract, contractimpl,
+        testutils::{Address as _, Ledger as _},
+    };
+
+    #[contract]
+    struct TreasuryTestContract;
+
+    #[contractimpl]
+    impl TreasuryTestContract {
+        pub fn marker() {}
+    }
+
+    const START: u64 = 1_000;
+
+    struct Fixture {
+        env: Env,
+        contract: Address,
+        admin: Address,
+    }
+
+    fn fixture() -> Fixture {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|ledger| ledger.timestamp = START);
+        let contract = env.register(TreasuryTestContract, ());
+        let admin = Address::generate(&env);
+        env.as_contract(&contract, || {
+            crate::admin::set_admin(&env, admin.clone(), None).unwrap();
+        });
+        Fixture {
+            env,
+            contract,
+            admin,
+        }
+    }
+
+    /// Give `owner` a lock that outlasts the boost window, so its voting power
+    /// stays at the full 2x `amount` for every quarter used in these tests.
+    fn lock(f: &Fixture, owner: &Address, amount: i128) {
+        f.env.as_contract(&f.contract, || {
+            f.env.storage().persistent().set(
+                &VoteEscrowKey::Lock(owner.clone()),
+                &EscrowLock {
+                    amount,
+                    unlock_time: START + 2 * MAX_LOCK_SECONDS,
+                },
+            );
+        });
+    }
+
+    fn seed_reserve(env: &Env, amount: i128) {
+        env.storage()
+            .persistent()
+            .set(&DepositDataKey::ProtocolReserve(None), &amount);
+    }
+
+    fn set_time(f: &Fixture, timestamp: u64) {
+        f.env
+            .ledger()
+            .with_mut(|ledger| ledger.timestamp = timestamp);
+    }
+
+    #[test]
+    fn quarter_disburses_budget_in_proportion_to_vote_weight() {
+        let f = fixture();
+        let r1 = Address::generate(&f.env);
+        let r2 = Address::generate(&f.env);
+        let alice = Address::generate(&f.env);
+        let bob = Address::generate(&f.env);
+        lock(&f, &alice, 1_000); // weight 2_000
+        lock(&f, &bob, 3_000); // weight 6_000
+
+        f.env.as_contract(&f.contract, || {
+            register_recipient(&f.env, f.admin.clone(), r1.clone()).unwrap();
+            register_recipient(&f.env, f.admin.clone(), r2.clone()).unwrap();
+            set_quarter_budget(&f.env, f.admin.clone(), None, 9_000).unwrap();
+            seed_reserve(&f.env, 10_000);
+
+            assert_eq!(
+                vote_for_recipient(&f.env, alice.clone(), r1.clone()),
+                Ok(2_000)
+            );
+            assert_eq!(
+                vote_for_recipient(&f.env, bob.clone(), r2.clone()),
+                Ok(6_000)
+            );
+        });
+
+        set_time(&f, QUARTER_SECONDS);
+        f.env.as_contract(&f.contract, || {
+            let payouts = disburse_quarter(&f.env, None, 0).unwrap();
+            assert_eq!(payouts.len(), 2);
+            // 9_000 * 2_000 / 8_000 = 2_250 and 9_000 * 6_000 / 8_000 = 6_750.
+            assert_eq!(
+                payouts.get(0).unwrap(),
+                Disbursement {
+                    recipient: r1.clone(),
+                    amount: 2_250
+                }
+            );
+            assert_eq!(
+                payouts.get(1).unwrap(),
+                Disbursement {
+                    recipient: r2.clone(),
+                    amount: 6_750
+                }
+            );
+            assert_eq!(get_reserve_balance(&f.env, None), 1_000);
+        });
+    }
+
+    #[test]
+    fn revote_moves_weight_instead_of_counting_twice() {
+        let f = fixture();
+        let r1 = Address::generate(&f.env);
+        let r2 = Address::generate(&f.env);
+        let alice = Address::generate(&f.env);
+        lock(&f, &alice, 1_000); // weight 2_000
+
+        f.env.as_contract(&f.contract, || {
+            register_recipient(&f.env, f.admin.clone(), r1.clone()).unwrap();
+            register_recipient(&f.env, f.admin.clone(), r2.clone()).unwrap();
+            set_quarter_budget(&f.env, f.admin.clone(), None, 1_000).unwrap();
+            seed_reserve(&f.env, 1_000);
+
+            vote_for_recipient(&f.env, alice.clone(), r1.clone()).unwrap();
+            vote_for_recipient(&f.env, alice.clone(), r2.clone()).unwrap();
+            assert_eq!(get_recipient_tally(&f.env, 0, r1.clone()), 0);
+            assert_eq!(get_recipient_tally(&f.env, 0, r2.clone()), 2_000);
+            assert_eq!(total_weight(&f.env, 0), 2_000);
+        });
+
+        set_time(&f, QUARTER_SECONDS);
+        f.env.as_contract(&f.contract, || {
+            let payouts = disburse_quarter(&f.env, None, 0).unwrap();
+            assert_eq!(payouts.len(), 1);
+            assert_eq!(
+                payouts.get(0).unwrap(),
+                Disbursement {
+                    recipient: r2.clone(),
+                    amount: 1_000
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn payout_is_capped_by_the_reserve_balance() {
+        let f = fixture();
+        let r1 = Address::generate(&f.env);
+        let r2 = Address::generate(&f.env);
+        let alice = Address::generate(&f.env);
+        let bob = Address::generate(&f.env);
+        lock(&f, &alice, 1_000); // weight 2_000
+        lock(&f, &bob, 3_000); // weight 6_000
+
+        f.env.as_contract(&f.contract, || {
+            register_recipient(&f.env, f.admin.clone(), r1.clone()).unwrap();
+            register_recipient(&f.env, f.admin.clone(), r2.clone()).unwrap();
+            set_quarter_budget(&f.env, f.admin.clone(), None, 9_000).unwrap();
+            seed_reserve(&f.env, 4_000);
+            vote_for_recipient(&f.env, alice.clone(), r1.clone()).unwrap();
+            vote_for_recipient(&f.env, bob.clone(), r2.clone()).unwrap();
+        });
+
+        set_time(&f, QUARTER_SECONDS);
+        f.env.as_contract(&f.contract, || {
+            let payouts = disburse_quarter(&f.env, None, 0).unwrap();
+            // Payable is min(9_000, 4_000) = 4_000, split 1:3.
+            assert_eq!(payouts.get(0).unwrap().amount, 1_000);
+            assert_eq!(payouts.get(1).unwrap().amount, 3_000);
+            assert_eq!(get_reserve_balance(&f.env, None), 0);
+        });
+    }
+
+    #[test]
+    fn quarter_cannot_be_disbursed_before_it_ends() {
+        let f = fixture();
+        let r1 = Address::generate(&f.env);
+        let alice = Address::generate(&f.env);
+        lock(&f, &alice, 1_000);
+
+        f.env.as_contract(&f.contract, || {
+            register_recipient(&f.env, f.admin.clone(), r1.clone()).unwrap();
+            set_quarter_budget(&f.env, f.admin.clone(), None, 500).unwrap();
+            seed_reserve(&f.env, 500);
+            vote_for_recipient(&f.env, alice.clone(), r1.clone()).unwrap();
+            assert_eq!(
+                disburse_quarter(&f.env, None, 0),
+                Err(TreasuryError::QuarterNotEnded)
+            );
+        });
+
+        // The failed attempt must not consume the quarter.
+        set_time(&f, QUARTER_SECONDS);
+        f.env.as_contract(&f.contract, || {
+            assert_eq!(disburse_quarter(&f.env, None, 0).unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn quarter_disburses_only_once() {
+        let f = fixture();
+        let r1 = Address::generate(&f.env);
+        let alice = Address::generate(&f.env);
+        lock(&f, &alice, 1_000);
+
+        f.env.as_contract(&f.contract, || {
+            register_recipient(&f.env, f.admin.clone(), r1.clone()).unwrap();
+            set_quarter_budget(&f.env, f.admin.clone(), None, 500).unwrap();
+            seed_reserve(&f.env, 500);
+            vote_for_recipient(&f.env, alice.clone(), r1.clone()).unwrap();
+        });
+
+        set_time(&f, QUARTER_SECONDS);
+        f.env.as_contract(&f.contract, || {
+            disburse_quarter(&f.env, None, 0).unwrap();
+            assert_eq!(
+                disburse_quarter(&f.env, None, 0),
+                Err(TreasuryError::AlreadyDisbursed)
+            );
+        });
+    }
+
+    #[test]
+    fn empty_quarter_pays_nothing_and_leaves_reserve_intact() {
+        let f = fixture();
+        let r1 = Address::generate(&f.env);
+
+        f.env.as_contract(&f.contract, || {
+            register_recipient(&f.env, f.admin.clone(), r1.clone()).unwrap();
+            set_quarter_budget(&f.env, f.admin.clone(), None, 500).unwrap();
+            seed_reserve(&f.env, 500);
+        });
+
+        set_time(&f, QUARTER_SECONDS);
+        f.env.as_contract(&f.contract, || {
+            assert_eq!(disburse_quarter(&f.env, None, 0).unwrap().len(), 0);
+            assert_eq!(get_reserve_balance(&f.env, None), 500);
+        });
+    }
+
+    #[test]
+    fn votes_count_only_toward_the_quarter_they_were_cast_in() {
+        let f = fixture();
+        let r1 = Address::generate(&f.env);
+        let r2 = Address::generate(&f.env);
+        let alice = Address::generate(&f.env);
+        lock(&f, &alice, 1_000);
+
+        f.env.as_contract(&f.contract, || {
+            register_recipient(&f.env, f.admin.clone(), r1.clone()).unwrap();
+            register_recipient(&f.env, f.admin.clone(), r2.clone()).unwrap();
+            set_quarter_budget(&f.env, f.admin.clone(), None, 1_000).unwrap();
+            seed_reserve(&f.env, 1_000);
+            vote_for_recipient(&f.env, alice.clone(), r1.clone()).unwrap(); // quarter 0
+        });
+
+        // Vote again in quarter 1; quarter 0's tally must not change.
+        set_time(&f, QUARTER_SECONDS + 10);
+        f.env.as_contract(&f.contract, || {
+            vote_for_recipient(&f.env, alice.clone(), r2.clone()).unwrap();
+            assert_eq!(get_recipient_tally(&f.env, 0, r1.clone()), 2_000);
+            assert_eq!(get_recipient_tally(&f.env, 1, r2.clone()), 2_000);
+            assert_eq!(get_recipient_tally(&f.env, 0, r2.clone()), 0);
+        });
+    }
+
+    #[test]
+    fn voter_must_hold_power_and_vote_for_a_registered_recipient() {
+        let f = fixture();
+        let r1 = Address::generate(&f.env);
+        let stranger_recipient = Address::generate(&f.env);
+        let alice = Address::generate(&f.env);
+        let no_lock = Address::generate(&f.env);
+        lock(&f, &alice, 1_000);
+
+        f.env.as_contract(&f.contract, || {
+            register_recipient(&f.env, f.admin.clone(), r1.clone()).unwrap();
+            assert_eq!(
+                vote_for_recipient(&f.env, alice.clone(), stranger_recipient.clone()),
+                Err(TreasuryError::UnknownRecipient)
+            );
+            assert_eq!(
+                vote_for_recipient(&f.env, no_lock.clone(), r1.clone()),
+                Err(TreasuryError::NoVotingPower)
+            );
+        });
+    }
+
+    #[test]
+    fn duplicate_registration_and_non_admin_actions_are_rejected() {
+        let f = fixture();
+        let r1 = Address::generate(&f.env);
+        let stranger = Address::generate(&f.env);
+
+        f.env.as_contract(&f.contract, || {
+            register_recipient(&f.env, f.admin.clone(), r1.clone()).unwrap();
+            assert_eq!(
+                register_recipient(&f.env, f.admin.clone(), r1.clone()),
+                Err(TreasuryError::DuplicateRecipient)
+            );
+            assert_eq!(
+                register_recipient(&f.env, stranger.clone(), Address::generate(&f.env)),
+                Err(TreasuryError::Unauthorized)
+            );
+            assert_eq!(
+                set_quarter_budget(&f.env, stranger.clone(), None, 100),
+                Err(TreasuryError::Unauthorized)
+            );
+            assert_eq!(
+                set_quarter_budget(&f.env, f.admin.clone(), None, -1),
+                Err(TreasuryError::InvalidAmount)
+            );
+        });
+    }
 }
